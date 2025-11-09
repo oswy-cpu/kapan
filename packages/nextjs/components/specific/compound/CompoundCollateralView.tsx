@@ -66,14 +66,6 @@ export const CompoundCollateralView: FC<CompoundCollateralViewProps> = ({
   // Only fetch data when the component is visible or when first mounted
   const shouldFetch = isVisible;
 
-  // Format currency with 2 decimal places
-  const formatNumber = (num: number) => {
-    return new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(num);
-  };
-
   // Format currency in USD
   const formatUSD = (amount: number) => {
     return new Intl.NumberFormat("en-US", {
@@ -171,9 +163,6 @@ export const CompoundCollateralView: FC<CompoundCollateralViewProps> = ({
     }
 
     const [addresses, balances, displayNames] = collateralData;
-
-    // Base token price converted to a number with 8 decimals
-    const baseTokenUsdPriceNumber = baseTokenUsdPrice ? Number(formatUnits(baseTokenUsdPrice, 8)) : 0;
 
     // Create positions with price data
     const positions = addresses.map((address: string, index: number) => {

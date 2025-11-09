@@ -60,14 +60,10 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
     }, {} as Record<string, boolean>);
   }, [collaterals]);
 
-  // Filter and sort: only show supported with balance, unless user wants to see all
+  // Filter & sort (unchanged)
   const { availableCollaterals, unsupportedCount } = useMemo(() => {
-    const available = collaterals.filter(
-      c => c.supported && c.rawBalance > 0n
-    );
-    const unsupported = collaterals.filter(
-      c => !c.supported || c.rawBalance === 0n
-    );
+    const available = collaterals.filter(c => c.supported && c.rawBalance > 0n);
+    const unsupported = collaterals.filter(c => !c.supported || c.rawBalance === 0n);
 
     const sorted = [...available].sort((a, b) => {
       if (a.balance > b.balance) return -1;
@@ -88,6 +84,7 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
     if (balance > 1000000) return (balance / 1000000).toFixed(2) + "M";
     if (balance > 1000) return (balance / 1000).toFixed(2) + "K";
     return balance.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    // kept identical behavior
   };
 
   const handleCollateralToggle = useCallback((collateral: CollateralToken) => {
@@ -120,9 +117,7 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
         ...c,
         supported: collateralSupportMap[c.token] ?? false,
       }));
-      const hasChanged = updated.some((collateral, index) => 
-        collateral.supported !== prev[index].supported
-      );
+      const hasChanged = updated.some((collateral, index) => collateral.supported !== prev[index].supported);
       return hasChanged ? updated : prev;
     });
   }, [collateralSupportMap, selectedProtocol]);
@@ -156,7 +151,7 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
       const maxAmount = selected.maxAmount;
       const formattedMaxAmount = formatUnits(maxAmount, selected.decimals);
       const updated = selectedCollaterals.map(c =>
-        c.token === token ? { ...c, amount: maxAmount, inputValue: formattedMaxAmount } : c
+        c.token === token ? { ...c, amount: maxAmount, inputValue: formattedMaxAmount } : c,
       );
       setSelectedCollaterals(updated);
       onCollateralSelectionChange(updated);
@@ -176,30 +171,28 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center py-8">
-        <span className="loading loading-spinner loading-md"></span>
+      <div className="flex items-center justify-center py-6">
+        <span className="loading loading-spinner loading-sm"></span>
         <span className="ml-2 text-sm">Loading...</span>
       </div>
     );
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
       {/* Compact header */}
-      <div className="flex items-center justify-between text-sm">
+      <div className="flex items-center justify-between text-[13px]">
         <span className="font-medium">Select Collateral</span>
         {selectedCollaterals.length > 0 && (
-          <span className="badge badge-primary badge-sm">{selectedCollaterals.length}</span>
+          <span className="badge badge-primary badge-sm rounded-none">{selectedCollaterals.length}</span>
         )}
       </div>
 
       {availableCollaterals.length === 0 ? (
-        <div className="text-center py-6 text-sm text-base-content/60">
-          No collateral available
-        </div>
+        <div className="text-center py-5 text-sm text-base-content/60">No collateral available</div>
       ) : (
         <>
-          {/* Compact collateral list */}
+          {/* Collateral list (compact, square) */}
           <div className="space-y-1.5">
             {displayCollaterals.map(collateral => {
               const isDisabled = !collateral.supported || collateral.rawBalance <= 0n;
@@ -208,83 +201,85 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
 
               return (
                 <div key={collateral.address}>
-                  {/* Compact selection row */}
+                  {/* Selection row */}
                   <button
                     onClick={() => handleCollateralToggle(collateral)}
                     disabled={isDisabled}
-                    className={`
-                      w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm
-                      transition-colors
-                      ${isSelected 
-                        ? 'bg-primary/10 border border-primary/30' 
-                        : 'bg-base-200/50 hover:bg-base-200'
-                      }
-                      ${isDisabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}
-                    `}
+                    className={[
+                      "w-full flex items-center gap-2 px-3 py-2 rounded-none text-sm transition-colors border",
+                      isSelected
+                        ? "bg-primary/10 border-primary/40"
+                        : "bg-base-200/40 border-base-300 hover:bg-base-200/70",
+                      isDisabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer",
+                    ].join(" ")}
                   >
-                    {/* Checkbox */}
-                    <div className={`
-                      w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0
-                      ${isSelected ? 'bg-primary border-primary' : 'border-base-300'}
-                    `}>
+                    {/* Checkbox (square) */}
+                    <div
+                      className={[
+                        "w-4 h-4 rounded-none border flex items-center justify-center flex-shrink-0",
+                        isSelected ? "bg-primary border-primary" : "border-base-300",
+                      ].join(" ")}
+                    >
                       {isSelected && (
-                        <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <svg className="w-3 h-3 text-primary-content" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
                         </svg>
                       )}
                     </div>
 
-                    {/* Icon */}
-                    <div className="w-6 h-6 relative flex-shrink-0">
+                    {/* Icon (contained) */}
+                    <span className="inline-flex w-5 h-5 overflow-hidden flex-shrink-0">
                       <Image
                         src={tokenNameToLogo(collateral.symbol)}
                         alt={collateral.symbol}
-                        fill
-                        className="rounded-full object-contain"
+                        width={20}
+                        height={20}
+                        className="object-contain w-5 h-5"
                       />
-                    </div>
+                    </span>
 
                     {/* Symbol */}
                     <span className="font-medium flex-1 text-left">{collateral.symbol}</span>
 
                     {/* Balance */}
-                    <span className="text-xs text-base-content/60 tabular-nums">
-                      {formatBalance(collateral.balance)}
-                    </span>
+                    <span className="text-xs text-base-content/60 tabular-nums">{formatBalance(collateral.balance)}</span>
 
-                    {/* Warning badge */}
+                    {/* Badge */}
                     {isDisabled && (
-                      <span className="text-[10px] px-1.5 py-0.5 bg-warning/20 text-warning rounded">
-                        {collateral.rawBalance === 0n ? 'Empty' : 'Not supported'}
+                      <span className="text-[10px] px-1.5 py-0.5 bg-warning/20 text-warning rounded-none">
+                        {collateral.rawBalance === 0n ? "Empty" : "Not supported"}
                       </span>
                     )}
                   </button>
 
-                  {/* Inline amount input - only when selected */}
+                  {/* Inline amount (square + compact) */}
                   {!hideAmounts && isSelected && selectedAmount && (
                     <div className="mt-1.5 ml-6 mr-2">
                       <div className="flex items-center gap-2">
                         <div className="flex-1 relative">
                           <input
                             type="text"
-                            value={selectedAmount.inputValue ?? 
-                              (selectedAmount.amount === 0n ? "" : formatUnits(selectedAmount.amount, selectedAmount.decimals))
+                            value={
+                              selectedAmount.inputValue ??
+                              (selectedAmount.amount === 0n
+                                ? ""
+                                : formatUnits(selectedAmount.amount, selectedAmount.decimals))
                             }
-                            onChange={(e) => handleAmountChange(collateral.address, e.target.value, collateral.decimals)}
-                            className="input input-sm input-bordered w-full text-right pr-12"
+                            onChange={e => handleAmountChange(collateral.address, e.target.value, collateral.decimals)}
+                            className="input input-sm input-bordered w-full text-right pr-14 rounded-none"
                             placeholder="0.00"
                             disabled={!selectedAmount.supported}
                           />
                           <button
                             onClick={() => handleSetMax(collateral.address)}
-                            className="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] font-medium px-2 py-0.5 bg-primary/10 hover:bg-primary hover:text-white rounded transition-colors"
+                            className="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] font-medium px-2 py-0.5 bg-primary/10 hover:bg-primary hover:text-white rounded-none transition-colors"
                             disabled={!selectedAmount.supported}
                           >
                             MAX
                           </button>
                         </div>
                       </div>
-                      <div className="text-[10px] text-base-content/50 text-right mt-0.5">
+                      <div className="text-[10px] text-base-content/60 text-right mt-0.5">
                         Max: {formatBalance(collateral.balance)}
                       </div>
                     </div>
@@ -294,30 +289,26 @@ export const CollateralSelector: FC<CollateralSelectorProps> = ({
             })}
           </div>
 
-          {/* Show unsupported toggle - only if there are unsupported items */}
+          {/* Toggle unsupported (unchanged logic, compact style) */}
           {unsupportedCount > 0 && (
             <button
               onClick={() => setShowUnsupported(!showUnsupported)}
-              className="btn btn-ghost btn-xs w-full gap-1 text-xs"
+              className="btn btn-ghost btn-xs w-full gap-1 text-xs rounded-none"
             >
               {showUnsupported ? <FiChevronUp /> : <FiChevronDown />}
-              {showUnsupported ? 'Hide' : 'Show'} unsupported ({unsupportedCount})
+              {showUnsupported ? "Hide" : "Show"} unsupported ({unsupportedCount})
             </button>
           )}
 
-          {/* Compact summary */}
+          {/* Summary (unchanged logic, compact style) */}
           {!hideAmounts && selectedCollaterals.length > 0 && (
-            <div className="bg-base-200/30 rounded-lg p-2.5 space-y-1 text-xs">
-              <div className="font-medium text-base-content/70 mb-1">Summary</div>
+            <div className="bg-base-200/30 rounded-none p-2 space-y-1 text-xs border border-base-300">
+              <div className="font-medium text-base-content/70">Summary</div>
               {selectedCollaterals.map(c => (
                 <div key={c.token} className="flex justify-between items-center">
                   <span className="text-base-content/60">{c.symbol}</span>
                   <span className="font-medium tabular-nums">
-                    {c.amount === 0n ? (
-                      <span className="text-warning">Not set</span>
-                    ) : (
-                      formatUnits(c.amount, c.decimals)
-                    )}
+                    {c.amount === 0n ? <span className="text-warning">Not set</span> : formatUnits(c.amount, c.decimals)}
                   </span>
                 </div>
               ))}
