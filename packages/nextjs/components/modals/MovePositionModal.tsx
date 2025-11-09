@@ -16,7 +16,6 @@ import { useCollateralSupport } from "~~/hooks/scaffold-eth/useCollateralSupport
 import { useCollaterals } from "~~/hooks/scaffold-eth/useCollaterals";
 import { useNetworkAwareReadContract } from "~~/hooks/useNetworkAwareReadContract";
 import { getProtocolLogo } from "~~/utils/protocol";
-import { CompactCollateralAmounts } from "../specific/collateral/CompactCollateralAmounts";
 
 type FlashLoanProvider = {
   name: "Balancer V2" | "Balancer V3" | "Aave V3";
