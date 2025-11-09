@@ -1,3 +1,4 @@
+// MovePositionModal.tsx
 import { FC, useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import { FaGasPump } from "react-icons/fa";
@@ -15,17 +16,28 @@ import { useCollateralSupport } from "~~/hooks/scaffold-eth/useCollateralSupport
 import { useCollaterals } from "~~/hooks/scaffold-eth/useCollaterals";
 import { useNetworkAwareReadContract } from "~~/hooks/useNetworkAwareReadContract";
 import { getProtocolLogo } from "~~/utils/protocol";
+import { CompactCollateralAmounts } from "../specific/collateral/CompactCollateralAmounts";
 
-// Define the step type for tracking the move flow
-type MoveStep = "idle" | "executing" | "done";
+type FlashLoanProvider = {
+  name: "Balancer V2" | "Balancer V3" | "Aave V3";
+  icon: string;
+  version: "v2" | "v3" | "aave";
+  providerEnum: 0 | 1 | 2;
+};
+
+const ALL_FLASH_LOAN_PROVIDERS: FlashLoanProvider[] = [
+  { name: "Balancer V2", icon: "/logos/balancer.svg", version: "v2", providerEnum: 0 },
+  { name: "Balancer V3", icon: "/logos/balancer.svg", version: "v3", providerEnum: 1 },
+  { name: "Aave V3",     icon: "/logos/aave.svg",     version: "aave", providerEnum: 2 },
+] as const;
 
 interface MovePositionModalProps {
   isOpen: boolean;
   onClose: () => void;
   fromProtocol: string;
   position: {
-    name: string;
-    balance: number; // USD value (display only)
+    name: string;            // token symbol (e.g., USDC)
+    balance: number;         // USD (display-only fallback)
     type: "supply" | "borrow";
     tokenAddress: string;
     decimals: number;
@@ -33,756 +45,594 @@ interface MovePositionModalProps {
   chainId?: number;
 }
 
-type FlashLoanProvider = {
-  name: "Balancer V2" | "Balancer V3" | "Aave V3";
-  icon: string;
-  version: "v2" | "v3" | "aave";
-  providerEnum: 0 | 1 | 2; // FlashLoanProvider enum: BalancerV2=0, BalancerV3=1, AaveV3=2
-};
+const BALANCER_CHAINS = [42161, 8453, 10];         // Arb, Base, Opt
+const AAVE_CHAINS     = [42161, 8453, 10, 59144];  // + Linea
 
-const ALL_FLASH_LOAN_PROVIDERS: FlashLoanProvider[] = [
-  { name: "Balancer V2", icon: "/logos/balancer.svg", version: "v2", providerEnum: 0 },
-  { name: "Balancer V3", icon: "/logos/balancer.svg", version: "v3", providerEnum: 1 },
-  { name: "Aave V3", icon: "/logos/aave.svg", version: "aave", providerEnum: 2 },
-] as const;
-
-// Extend the collateral type with rawBalance
 export const MovePositionModal: FC<MovePositionModalProps> = ({ isOpen, onClose, fromProtocol, position, chainId }) => {
   const { address: userAddress, chain } = useAccount();
   const { switchChain } = useSwitchChain();
+
+  // Router + batching
+  const { createMoveBuilder, executeFlowBatchedIfPossible } = useKapanRouterV2();
+  const { enabled: preferBatching, setEnabled: setPreferBatching, isLoaded: isPreferenceLoaded } = useBatchingPreference();
+
+  // Contracts
+  const { data: routerContract } = useDeployedContractInfo({ contractName: "KapanRouter", chainId: chainId as any });
   const protocols = [{ name: "Aave V3" }, { name: "Compound V3" }, { name: "Venus" }];
   const availableProtocols = protocols.filter(p => p.name !== fromProtocol);
-  
-  const [selectedProtocol, setSelectedProtocol] = useState(availableProtocols[0]?.name || "");
-  const [amount, setAmount] = useState("");
-  const [selectedCollateralsWithAmounts, setSelectedCollateralsWithAmounts] = useState<CollateralWithAmount[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [isRepayingAll, setIsRepayingAll] = useState(false);
-  const [step, setStep] = useState<MoveStep>("idle");
-  const [error, setError] = useState<string | null>(null);
 
-  // Check which flash loan providers are available on the router using enabled functions
-  // These are view functions in FlashLoanConsumerBase that check if addresses are non-zero
-  const { data: routerContract } = useDeployedContractInfo({ contractName: "KapanRouter", chainId: chainId as any });
+  // Selections (single-screen)
+  const [destProtocol, setDestProtocol] = useState<string>(availableProtocols[0]?.name || "");
+  const [flashProvider, setFlashProvider] = useState<FlashLoanProvider | null>(null);
+  const [selectedCollats, setSelectedCollats] = useState<CollateralWithAmount[]>([]);
+  const [amount, setAmount] = useState("");
+  const [isMaxDebt, setIsMaxDebt] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [destOpen, setDestOpen] = useState(false);
+  const [flashOpen, setFlashOpen] = useState(false);
   
-  const { data: balancerV2Enabled, isLoading: isLoadingBalancerV2 } = useReadContract({
+  const blurActive = () => {
+    const el = document.activeElement as HTMLElement | null;
+    if (el && typeof el.blur === "function") el.blur();
+  };
+  // Network guard
+  useEffect(() => {
+    if (!isOpen || !chainId) return;
+    if (chain?.id !== chainId) {
+      try { switchChain?.({ chainId }); } catch {}
+    }
+  }, [isOpen, chainId, chain?.id, switchChain]);
+
+  // Flash availability
+  const { data: balancerV2Enabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "balancerV2Enabled",
     query: { enabled: isOpen && !!chainId && !!routerContract?.address },
   });
-
-  const { data: balancerV3Enabled, isLoading: isLoadingBalancerV3 } = useReadContract({
+  const { data: balancerV3Enabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "balancerV3Enabled",
     query: { enabled: isOpen && !!chainId && !!routerContract?.address },
   });
-
-  const { data: aaveEnabled, isLoading: isLoadingAave } = useReadContract({
+  const { data: aaveEnabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "aaveEnabled",
     query: { enabled: isOpen && !!chainId && !!routerContract?.address },
   });
 
-  // Chain-based provider availability (from deployment script)
-  // Balancer is only available on Arbitrum, Base, and Optimism
-  // Aave V3 is available on Arbitrum, Base, Optimism, and Linea
-  const BALANCER_CHAINS = [42161, 8453, 10]; // Arbitrum, Base, Optimism
-  const AAVE_CHAINS = [42161, 8453, 10, 59144]; // Arbitrum, Base, Optimism, Linea
-
-  // Filter available flash loan providers based on what's enabled AND chain support
-  // Only include providers once we've finished loading their status
-  const availableFlashLoanProviders = useMemo(() => {
-    const providers: FlashLoanProvider[] = [];
-    
-    // Only check if we're not loading (to avoid showing providers that will be filtered out)
-    // Also check chain support - Balancer is not available on Linea
-    if (!isLoadingBalancerV2 && balancerV2Enabled === true && chainId && BALANCER_CHAINS.includes(chainId)) {
-      providers.push(ALL_FLASH_LOAN_PROVIDERS[0]);
-    }
-    
-    if (!isLoadingBalancerV3 && balancerV3Enabled === true && chainId && BALANCER_CHAINS.includes(chainId)) {
-      providers.push(ALL_FLASH_LOAN_PROVIDERS[1]);
-    }
-    
-    if (!isLoadingAave && aaveEnabled === true && chainId && AAVE_CHAINS.includes(chainId)) {
-      providers.push(ALL_FLASH_LOAN_PROVIDERS[2]);
-    }
-    
-    return providers;
-  }, [balancerV2Enabled, balancerV3Enabled, aaveEnabled, isLoadingBalancerV2, isLoadingBalancerV3, isLoadingAave, chainId]);
-
-  // Set default selected provider (first available)
-  const [selectedFlashLoanProvider, setSelectedFlashLoanProvider] = useState<FlashLoanProvider | null>(null);
+  const availableFlash = useMemo(() => {
+    const out: FlashLoanProvider[] = [];
+    if (balancerV2Enabled && chainId && BALANCER_CHAINS.includes(chainId)) out.push(ALL_FLASH_LOAN_PROVIDERS[0]);
+    if (balancerV3Enabled && chainId && BALANCER_CHAINS.includes(chainId)) out.push(ALL_FLASH_LOAN_PROVIDERS[1]);
+    if (aaveEnabled     && chainId && AAVE_CHAINS.includes(chainId))     out.push(ALL_FLASH_LOAN_PROVIDERS[2]);
+    return out;
+  }, [balancerV2Enabled, balancerV3Enabled, aaveEnabled, chainId]);
 
   useEffect(() => {
-    if (availableFlashLoanProviders.length > 0) {
-      // Update selected provider if current one is not available, or set first available if none selected
-      if (!selectedFlashLoanProvider || !availableFlashLoanProviders.includes(selectedFlashLoanProvider)) {
-        setSelectedFlashLoanProvider(availableFlashLoanProviders[0]);
-      }
-    } else {
-      setSelectedFlashLoanProvider(null);
-    }
-  }, [availableFlashLoanProviders, selectedFlashLoanProvider]);
+    if (availableFlash.length === 0) setFlashProvider(null);
+    else if (!flashProvider || !availableFlash.includes(flashProvider)) setFlashProvider(availableFlash[0]);
+  }, [availableFlash, flashProvider]);
 
-  // Fetch collaterals from the contract.
-  const { collaterals: fetchedCollaterals, isLoading: isLoadingCollaterals } = useCollaterals(
+  // Collaterals on source
+  const { collaterals: fetchedCollats, isLoading: isLoadingCollats } = useCollaterals(
     position.tokenAddress,
     fromProtocol,
     userAddress || "0x0000000000000000000000000000000000000000",
     isOpen,
   );
-
-  // Memoize the collateral addresses to prevent recreation on every render.
   const collateralAddresses = useMemo(
-    () => fetchedCollaterals.map((collateral: any) => collateral.address),
-    // Stable dependency - stringify the addresses to avoid reference comparisons
-    [JSON.stringify(fetchedCollaterals.map((c: any) => c.address))],
+    () => fetchedCollats.map((c: any) => c.address),
+    // stable dep while avoiding object identity churn
+    [JSON.stringify(fetchedCollats.map((c: any) => c.address))],
   );
 
-  // Check collateral support for each available protocol (for dropdown compatibility)
-  const aaveSupport = useCollateralSupport("Aave V3", position.tokenAddress, collateralAddresses, isOpen && position.type === "borrow");
-  const compoundSupport = useCollateralSupport("Compound V3", position.tokenAddress, collateralAddresses, isOpen && position.type === "borrow");
-  const venusSupport = useCollateralSupport("Venus", position.tokenAddress, collateralAddresses, isOpen && position.type === "borrow");
-
-  // Map protocol names to their support status
-  type ProtocolSupportMap = {
-    "Aave V3": boolean | null;
-    "Compound V3": boolean | null;
-    "Venus": boolean | null;
-  };
-  
-  const protocolSupportMap = useMemo<ProtocolSupportMap>(() => {
-    if (position.type !== "borrow") {
-      // Supply positions don't need collateral, so all protocols are compatible
-      return {
-        "Aave V3": true,
-        "Compound V3": true,
-        "Venus": true,
-      };
-    }
-    
-    const checkHasSupported = (support: { supportedCollaterals: Record<string, boolean>; isLoading: boolean }) => {
-      if (support.isLoading) return null; // Still loading
-      return Object.values(support.supportedCollaterals).some(supported => supported === true);
-    };
-
-    return {
-      "Aave V3": checkHasSupported(aaveSupport),
-      "Compound V3": checkHasSupported(compoundSupport),
-      "Venus": checkHasSupported(venusSupport),
-    };
-  }, [aaveSupport, compoundSupport, venusSupport, position.type]);
-
-  // Find a protocol with supported collaterals for default selection
-  const defaultProtocol = useMemo(() => {
-    // First try to find a protocol with supported collaterals
-    const compatibleProtocol = availableProtocols.find(p => protocolSupportMap[p.name as keyof ProtocolSupportMap] === true);
-    if (compatibleProtocol) return compatibleProtocol.name;
-    
-    // If none found, use the first available protocol
-    return availableProtocols[0]?.name || "";
-  }, [availableProtocols, protocolSupportMap]);
-
-  // Update selected protocol when default changes (e.g., when support data loads)
-  useEffect(() => {
-    if (!selectedProtocol && defaultProtocol) {
-      setSelectedProtocol(defaultProtocol);
-    } else if (selectedProtocol && protocolSupportMap[selectedProtocol as keyof ProtocolSupportMap] === false && defaultProtocol) {
-      // If current selection is incompatible and a compatible one is available, switch to it
-      setSelectedProtocol(defaultProtocol);
-    }
-  }, [defaultProtocol, selectedProtocol, protocolSupportMap, setSelectedProtocol]);
-
-  // Use the hook to check collateral support for the selected protocol.
-  const { isLoading: isLoadingCollateralSupport, supportedCollaterals } = useCollateralSupport(
-    selectedProtocol,
+  // Support map for destination
+  const { isLoading: isLoadingSupport, supportedCollaterals } = useCollateralSupport(
+    destProtocol,
     position.tokenAddress,
     collateralAddresses,
     isOpen,
   );
+  const collatsForSelector = useMemo(
+    () =>
+      fetchedCollats.map((c: any) => ({
+        ...c,
+        supported: supportedCollaterals[c.address] === true,
+      })),
+    [fetchedCollats, supportedCollaterals],
+  );
 
-  // Combine fetched collaterals with support status.
-  const collateralsForSelector = useMemo(() => {
-    return fetchedCollaterals.map(
-      (collateral: { symbol: string; balance: number; address: string; decimals: number; rawBalance: bigint }) => {
-        return {
-          ...collateral,
-          supported: supportedCollaterals[collateral.address] === true,
-        };
-      },
-    );
-  }, [fetchedCollaterals, supportedCollaterals]);
-
-  // Check if there are any supported collaterals available
-  const hasSupportedCollaterals = useMemo(() => {
-    if (position.type !== "borrow") return true; // Supply positions don't need collateral
-    if (isLoadingCollaterals || isLoadingCollateralSupport) return true; // Don't show error while loading
-    return collateralsForSelector.some(c => c.supported === true);
-  }, [collateralsForSelector, isLoadingCollaterals, isLoadingCollateralSupport, position.type]);
-
-  // Fetch USD prices for debt token and selected collaterals using EVM helper
+  // Prices (collats + debt)
   const { data: tokenPrices } = useNetworkAwareReadContract({
     networkType: "evm",
     contractName: "UiHelper",
     functionName: "get_asset_prices",
-    args: [[...collateralsForSelector.map(c => c.address), position.tokenAddress]],
+    args: [[...collatsForSelector.map(c => c.address), position.tokenAddress]],
     query: { enabled: isOpen },
   });
+  const tokenToPrices = useMemo(() => {
+    const map: Record<string, bigint> = {};
+    const prices = (tokenPrices as unknown as bigint[]) || [];
+    const addrs = [...collatsForSelector.map(c => c.address), position.tokenAddress];
+    addrs.forEach((addr, i) => (map[(addr || "").toLowerCase()] = (prices[i] ?? 0n) / 10n ** 10n)); // keep as 1e8
+    return map;
+  }, [tokenPrices, collatsForSelector, position.tokenAddress]);
 
-  const { tokenToPrices } = useMemo(() => {
-    if (!tokenPrices) return { tokenToPrices: {} as Record<string, bigint> };
-    const prices = tokenPrices as unknown as bigint[];
-    const addresses = [...collateralsForSelector.map(c => c.address), position.tokenAddress];
-    return {
-      tokenToPrices: prices.reduce(
-        (acc, price, index) => {
-          acc[addresses[index].toLowerCase()] = price / 10n ** 10n;
-          return acc;
-        },
-        {} as Record<string, bigint>,
-      ),
-    };
-  }, [tokenPrices, collateralsForSelector, position.tokenAddress]);
-
-  // Move position hook with modular builder
-  const { createMoveBuilder, executeFlowBatchedIfPossible } = useKapanRouterV2();
-  const { enabled: preferBatching, setEnabled: setPreferBatching, isLoaded: isPreferenceLoaded } = useBatchingPreference();
-
-  // Map protocol names to gateway view contract names
-  const PROTOCOL_TO_GATEWAY_MAP: Record<string, "AaveGatewayView" | "CompoundGatewayView" | "VenusGatewayView"> = {
+  // Debt balance
+  const PROTOCOL_TO_GATEWAY: Record<string, "AaveGatewayView" | "CompoundGatewayView" | "VenusGatewayView"> = {
     aave: "AaveGatewayView",
     compound: "CompoundGatewayView",
     venus: "VenusGatewayView",
   };
-
-  // Read on-chain borrow balance using gateway view contract
-  const normalizedFromProtocol = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
-  const gatewayContractName = PROTOCOL_TO_GATEWAY_MAP[normalizedFromProtocol] || "AaveGatewayView"; // Default fallback
+  const normalizedFrom = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+  const gatewayContractName = PROTOCOL_TO_GATEWAY[normalizedFrom] || "AaveGatewayView";
 
   const { data: tokenBalance } = useScaffoldReadContract({
     contractName: gatewayContractName,
     functionName: "getBorrowBalance",
-    args: [
-      position.tokenAddress,
-      userAddress || "0x0000000000000000000000000000000000000000",
-    ],
-    query: {
-      enabled: isOpen,
-    },
+    args: [position.tokenAddress, userAddress || "0x0000000000000000000000000000000000000000"],
+    query: { enabled: isOpen },
   });
 
-  // Read token decimals.
   const { data: decimals } = useReadContract({
     address: position.tokenAddress as `0x${string}`,
     abi: ERC20ABI,
     functionName: "decimals",
-    query: {
-      enabled: isOpen,
-    },
+    query: { enabled: isOpen },
   });
 
-  // Note: Flash loan provider balance check removed - the new builder handles flash loans internally
-  // Flash loan availability is managed by the router contract
+  // Helpers
+  const fmt = (n: number | string, maxFrac = 6) => {
+    const v = typeof n === "string" ? parseFloat(n) : n;
+    if (isNaN(v)) return "0.00";
+    return new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: maxFrac }).format(v);
+  };
 
-  // Reset the state when the modal is closed
-  useEffect(() => {
-    if (!isOpen) {
-      setAmount("");
-      setError(null);
-      setStep("idle");
-      setLoading(false);
-      setIsRepayingAll(false);
-      setSelectedCollateralsWithAmounts([]);
-    }
-  }, [isOpen]);
+  const debtTokenPrice = useMemo(
+    () => Number(formatUnits(tokenToPrices[(position.tokenAddress || "").toLowerCase()] || 0n, 8)),
+    [tokenToPrices, position.tokenAddress],
+  );
 
-  // Ensure wallet is on the correct EVM network when modal opens
-  useEffect(() => {
-    if (!isOpen || !chainId) return;
-    if (chain?.id !== chainId) {
-      try {
-        switchChain?.({ chainId });
-      } catch (e) {
-        console.warn("Auto network switch failed", e);
-      }
-    }
-  }, [isOpen, chainId, chain?.id, switchChain]);
-
-  // Note: Flash loan provider balance check removed - handled by router
-
-  // Memoize formatted token balance.
-  const formattedTokenBalance = useMemo(() => {
+  const formattedDebtBalance = useMemo(() => {
     if (!tokenBalance || !decimals) return "0";
     return formatUnits(tokenBalance, decimals as number);
   }, [tokenBalance, decimals]);
 
-  // Format number with thousands separators for display
-  const formatDisplayNumber = (value: string | number) => {
-    const num = typeof value === "string" ? parseFloat(value) : value;
-    if (isNaN(num)) return "0.00";
-    return new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 6,
-    }).format(num);
-  };
+  const debtUsd = useMemo(() => {
+    const n = parseFloat(amount || "0");
+    if (!n || !debtTokenPrice) return 0;
+    return n * debtTokenPrice;
+  }, [amount, debtTokenPrice]);
 
-  const debtUsdValue = useMemo(() => {
-    if (!amount) return 0;
-    const price = tokenToPrices[position.tokenAddress.toLowerCase()];
-    const usdPerToken = price
-      ? Number(formatUnits(price, 8))
-      : position.balance / parseFloat(formattedTokenBalance || "1");
-    return parseFloat(amount) * usdPerToken;
-  }, [amount, tokenToPrices, position.tokenAddress, position.balance, formattedTokenBalance]);
-
-  const totalCollateralUsd = useMemo(
+  const collatsUsd = useMemo(
     () =>
-      selectedCollateralsWithAmounts.reduce((sum, c) => {
-        const price = tokenToPrices[c.token.toLowerCase()];
+      selectedCollats.reduce((sum, c) => {
+        const addr = ((c as any).token || (c as any).address || "").toLowerCase();
+        const p = tokenToPrices[addr];
         const normalized = Number(formatUnits(c.amount, c.decimals));
-        const usd = price ? normalized * Number(formatUnits(price, 8)) : 0;
+        const usd = p ? normalized * Number(formatUnits(p, 8)) : 0;
         return sum + usd;
       }, 0),
-    [selectedCollateralsWithAmounts, tokenToPrices],
+    [selectedCollats, tokenToPrices],
   );
 
-  const handleSetMaxAmount = () => {
-    setAmount(formattedTokenBalance);
-    setIsRepayingAll(true);
+  // Inline validation (single page)
+  const issues = useMemo(() => {
+    const list: string[] = [];
+    if (!destProtocol) list.push("Select a destination protocol.");
+    if (position.type === "borrow" && availableFlash.length === 0) list.push("No flash loan provider available on this network.");
+    if (chainId && chain?.id !== chainId) list.push("Wrong network selected in wallet.");
+    if (position.type === "borrow") {
+      if (!isLoadingSupport && !collatsForSelector.some(c => c.supported)) list.push("Destination has no supported collateral.");
+      if (selectedCollats.length === 0) list.push("Choose at least one collateral to move.");
+    }
+    const n = parseFloat(amount || "0");
+    if (!amount || isNaN(n) || n <= 0) list.push("Enter a valid debt amount.");
+    if (n > parseFloat(formattedDebtBalance)) list.push("Amount exceeds your current debt.");
+    return list;
+  }, [
+    destProtocol,
+    position.type,
+    availableFlash.length,
+    chainId,
+    chain?.id,
+    isLoadingSupport,
+    collatsForSelector,
+    selectedCollats.length,
+    amount,
+    formattedDebtBalance,
+  ]);
+
+  const canConfirm = issues.length === 0 && !loading;
+
+  // Actions
+  const onChangeCollats = useCallback((list: CollateralWithAmount[]) => setSelectedCollats(list), []);
+
+  const setMaxAmount = () => {
+    setAmount(formattedDebtBalance);
+    setIsMaxDebt(true);
   };
 
-  const handleAmountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setAmount(e.target.value);
-    setIsRepayingAll(false);
-  };
-
-  const handleMoveDebt = async () => {
+  const handleConfirm = async () => {
     try {
-      if (chainId && chain?.id !== chainId) {
-        try {
-          await switchChain?.({ chainId });
-        } catch (e) {
-          setError("Please switch to the selected network to proceed");
-          return;
-        }
-      }
-      if (!userAddress) throw new Error("Wallet not connected");
-      if (!decimals) throw new Error("Token decimals not loaded");
-      if (!selectedProtocol) throw new Error("Please select a destination protocol");
       setLoading(true);
-      setError(null);
-      setStep("executing");
+      setErr(null);
+      if (!userAddress) throw new Error("Connect your wallet.");
+      if (!decimals) throw new Error("Token decimals not loaded.");
+      if (!destProtocol) throw new Error("Select destination protocol.");
+      if (position.type === "supply") throw new Error("Supply move not implemented yet.");
+      if (!flashProvider) throw new Error("No flash loan provider available.");
 
-      // Create the modular builder
       const builder = createMoveBuilder();
 
-      // Normalize protocol names for comparison
-      const normalizedSelectedProtocol = selectedProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
-      const normalizedFromProtocol = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
-
-      // For Compound, set the market (debt token = base token = market)
-      if (normalizedSelectedProtocol === "compound" || normalizedFromProtocol === "compound") {
+      // Compound market hint if needed
+      const normSel = destProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+      const normFrom = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+      if (normSel === "compound" || normFrom === "compound") {
         builder.setCompoundMarket(position.tokenAddress as `0x${string}`);
       }
 
-      if (position.type === "borrow") {
-        // Calculate debt amount
-        const debtAmountStr = isRepayingAll 
-          ? formatUnits(tokenBalance as bigint, decimals as number)
-          : amount;
+      const debtStr = isMaxDebt
+        ? formatUnits((tokenBalance || 0n) as bigint, (decimals as number) || position.decimals)
+        : amount;
+      const n = parseFloat(debtStr || "0");
+      if (!debtStr || isNaN(n) || n <= 0) throw new Error("Invalid debt amount.");
+      if (isMaxDebt && (!tokenBalance || tokenBalance === 0n)) throw new Error("No outstanding debt.");
 
-        // Validate debt amount
-        if (!debtAmountStr || debtAmountStr === "0" || debtAmountStr === "0.0" || parseFloat(debtAmountStr) <= 0) {
-          throw new Error("Invalid debt amount. Please enter a valid amount or ensure you have outstanding debt.");
-        }
+      // 1) Flash-unlock debt
+      builder.buildUnlockDebt({
+        fromProtocol,
+        debtToken: position.tokenAddress as `0x${string}`,
+        expectedDebt: debtStr,
+        debtDecimals: (decimals as number) || position.decimals,
+        flash: { version: flashProvider.version, premiumBps: 9, bufferBps: 10 },
+      });
 
-        // Validate token balance for max repay
-        if (isRepayingAll && (!tokenBalance || tokenBalance === 0n)) {
-          throw new Error("No outstanding debt found. Cannot move position.");
-        }
-
-        // 1) Unlock debt using flash loan
-        if (!selectedFlashLoanProvider) {
-          throw new Error("No flash loan provider available");
-        }
-        builder.buildUnlockDebt({
+      // 2) Move collats
+      for (const c of selectedCollats) {
+        const isMax = c.amount === c.maxAmount;
+        builder.buildMoveCollateral({
           fromProtocol,
-          debtToken: position.tokenAddress as `0x${string}`,
-          expectedDebt: debtAmountStr,
-          debtDecimals: decimals as number,
-          flash: {
-            version: selectedFlashLoanProvider.version,
-            premiumBps: 9, // TODO: Fetch from on-chain for Aave v3
-            bufferBps: 10, // Small buffer for interest accrual
-          },
+          toProtocol: destProtocol,
+          collateralToken: (c as any).token as `0x${string}`,
+          withdraw: isMax ? { max: true } : { amount: formatUnits(c.amount, c.decimals) },
+          collateralDecimals: c.decimals,
         });
-
-        // 2) Move each collateral from source to target protocol
-        for (const collateral of selectedCollateralsWithAmounts) {
-          // Check if user selected max by comparing amount to maxAmount
-          const isMax = collateral.amount === collateral.maxAmount;
-          builder.buildMoveCollateral({
-            fromProtocol,
-            toProtocol: selectedProtocol,
-            collateralToken: collateral.token as `0x${string}`,
-            withdraw: isMax ? { max: true } : { amount: formatUnits(collateral.amount, collateral.decimals) },
-            collateralDecimals: collateral.decimals,
-          });
-        }
-
-        // 3) Borrow to cover flash loan repayment
-        builder.buildBorrow({
-          mode: "coverFlash",
-          toProtocol: selectedProtocol,
-          token: position.tokenAddress as `0x${string}`,
-          decimals: decimals as number,
-          extraBps: 5, // Small extra headroom
-          approveToRouter: true,
-        });
-
-        // Execute the flow with automatic approvals (batched when supported)
-        await executeFlowBatchedIfPossible(builder.build(), preferBatching);
-
-        setStep("done");
-        // Close modal after a short delay on success
-        setTimeout(() => onClose(), 2000);
-      } else {
-        setError("Supply move not implemented yet");
-        console.log("Supply move not implemented yet");
       }
-    } catch (err: any) {
-      console.error("Move debt failed:", err);
-      setError(err.message || "Move position failed");
-      setStep("idle");
+
+      // 3) Borrow on destination to repay flash
+      builder.buildBorrow({
+        mode: "coverFlash",
+        toProtocol: destProtocol,
+        token: position.tokenAddress as `0x${string}`,
+        decimals: (decimals as number) || position.decimals,
+        extraBps: 5,
+        approveToRouter: true,
+      });
+
+      await executeFlowBatchedIfPossible(builder.build(), preferBatching);
+      onClose();
+    } catch (e: any) {
+      setErr(e?.message || "Move failed.");
     } finally {
       setLoading(false);
     }
   };
 
-  // Get action button text based on current step
-  const getActionButtonText = () => {
-    if (loading) {
-      switch (step) {
-        case "executing":
-          return "Moving...";
-        default:
-          return "Processing...";
-      }
-    }
-
-    if (step === "done") {
-      return "Done!";
-    }
-
-    return "Migrate";
-  };
-
-  // Get action button class based on current step
-  const getActionButtonClass = () => {
-    if (step === "done") {
-      return "btn-success";
-    }
-    return "btn-primary";
-  };
-
-  // Handler for collateral selection and amount changes
-  const handleCollateralSelectionChange = useCallback((collaterals: CollateralWithAmount[]) => {
-    setSelectedCollateralsWithAmounts(collaterals);
-  }, []);
-
-  const isActionDisabled =
-    loading ||
-    !selectedProtocol ||
-    !amount ||
-    !!(tokenBalance && decimals && parseFloat(amount) > parseFloat(formattedTokenBalance)) ||
-    !!(position.type === "borrow" && selectedCollateralsWithAmounts.length === 0) ||
-    step !== "idle";
-
+  // UI
   return (
     <dialog className={`modal ${isOpen ? "modal-open" : ""}`}>
-      <div className="modal-box bg-base-100 max-w-5xl max-h-[90vh] min-h-[360px] p-6 rounded-none flex flex-col">
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-8 h-full flex-grow">
-          {/* FROM SECTION */}
-          <div className="space-y-6 md:col-span-3">
-            <div>
-              <label className="text-sm font-medium text-base-content/80">From</label>
-              <div className="flex items-center gap-3 h-14 border-b-2 border-base-300 px-1">
-                <Image
-                  src={getProtocolLogo(fromProtocol)}
-                  alt={fromProtocol}
-                  width={32}
-                  height={32}
-                  className="rounded-full min-w-[32px]"
-                />
-                <span className="truncate font-semibold text-lg">{fromProtocol}</span>
+      <div className="modal-box bg-base-100 max-w-6xl max-h-[90vh] p-6 rounded-none">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-base-300 pb-3 mb-5">
+          <div className="flex items-center gap-3">
+            <Image src={getProtocolLogo(fromProtocol)} alt={fromProtocol} width={28} height={28} className="rounded-full" />
+            <div className="text-sm">
+              <div className="font-semibold">Move Position</div>
+              <div className="text-xs text-base-content/60">
+                {fromProtocol} • {position.type === "borrow" ? "Moving borrow" : "Moving supply"}
               </div>
-            </div>
-            {position.type === "borrow" && (
-              <div className="mt-6">
-                {!hasSupportedCollaterals ? (
-                  <div className="alert alert-warning">
-                    <FiAlertTriangle className="w-5 h-5" />
-                    <span>Can&apos;t move position due to no collateral being supported.</span>
-                  </div>
-                ) : (
-                  <CollateralSelector
-                    collaterals={collateralsForSelector}
-                    isLoading={isLoadingCollaterals || isLoadingCollateralSupport}
-                    selectedProtocol={selectedProtocol}
-                    onCollateralSelectionChange={handleCollateralSelectionChange}
-                    marketToken={position.tokenAddress}
-                    hideAmounts
-                  />
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* AMOUNTS SECTION */}
-          <div className="space-y-6 md:col-span-6">
-            <div>
-              <div className="text-center mb-2">
-                <label className="block text-lg font-semibold flex items-center justify-center gap-1">
-                  Debt
-                  {position.type === "supply" && <FiLock className="text-emerald-500 w-4 h-4" title="Supplied asset" />}
-                </label>
-                <div className="text-xs text-base-content/60">
-                  Available: {formatDisplayNumber(formattedTokenBalance)} {position.name}
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-2 w-32 shrink-0">
-                  <div className="w-6 h-6 relative">
-                    <Image
-                      src={tokenNameToLogo(position.name)}
-                      alt={position.name}
-                      fill
-                      className="rounded-full object-contain"
-                    />
-                  </div>
-                  <span className="truncate font-medium">{position.name}</span>
-                </div>
-                <input
-                  type="text"
-                  className="flex-1 border-b-2 border-base-300 focus:border-primary bg-transparent px-2 h-14 text-lg text-right"
-                  placeholder="0.00"
-                  value={amount}
-                  onChange={handleAmountChange}
-                  disabled={loading || step !== "idle"}
-                />
-                <button
-                  className="text-xs font-medium px-2 py-1"
-                  onClick={handleSetMaxAmount}
-                  disabled={loading || step !== "idle"}
-                >
-                  MAX
-                </button>
-              </div>
-            </div>
-            {position.type === "borrow" && (
-              <CollateralAmounts
-                collaterals={selectedCollateralsWithAmounts}
-                onChange={setSelectedCollateralsWithAmounts}
-                selectedProtocol={selectedProtocol}
-              />
-            )}
-
-            {error && (
-              <div className="alert alert-error shadow-lg">
-                <FiAlertTriangle className="w-6 h-6" />
-                <div className="text-sm flex-1">{error}</div>
-              </div>
-            )}
-
-            <div className="flex justify-between text-sm text-base-content/70">
-              <span>Debt Value: ${formatDisplayNumber(debtUsdValue)}</span>
-              {position.type === "borrow" && <span>Collateral Value: ${formatDisplayNumber(totalCollateralUsd)}</span>}
             </div>
           </div>
+          <div className="flex items-center gap-2 text-sm">
+            <div className="w-6 h-6 relative">
+              <Image src={tokenNameToLogo(position.name)} alt={position.name} fill className="rounded-full object-contain" />
+            </div>
+            <div className="font-medium">{position.name}</div>
+            <div className="text-xs text-base-content/60">Debt: {formatUnits((tokenBalance || 0n) as bigint, (decimals as number) || position.decimals)} {position.name}</div>
+          </div>
+        </div>
 
-          {/* TO SECTION */}
-          <div className="space-y-6 md:col-span-3">
-            <div>
-              <label className="text-sm font-medium text-base-content/80">To</label>
-              <div className="dropdown w-full">
+        {/* Body: compact two-column */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left: inputs */}
+          <div className="lg:col-span-7 space-y-6">
+
+            {/* Destination protocol */}
+            <section className="card bg-base-200 p-4">
+              <div className="text-sm font-medium mb-2">Destination Protocol</div>
+
+              <div className={`dropdown w-full ${destOpen ? "dropdown-open" : ""}`}>
                 <div
                   tabIndex={0}
+                  role="button"
                   className="border-b-2 border-base-300 py-3 px-1 flex items-center justify-between cursor-pointer h-14"
+                  onClick={() => setDestOpen(o => !o)}
+                  onKeyDown={e => e.key === "Escape" && setDestOpen(false)}
                 >
                   <div className="flex items-center gap-3 w-[calc(100%-32px)] overflow-hidden">
-                    {selectedProtocol ? (
+                    {destProtocol ? (
                       <>
-                        <Image
-                          src={getProtocolLogo(selectedProtocol)}
-                          alt={selectedProtocol}
-                          width={32}
-                          height={32}
-                          className="rounded-full min-w-[32px]"
-                        />
-                        <span className="truncate font-semibold text-lg">{selectedProtocol}</span>
+                        <Image src={getProtocolLogo(destProtocol)} alt={destProtocol} width={28} height={28} className="rounded-full min-w-[28px]" />
+                        <span className="truncate font-semibold">{destProtocol}</span>
                       </>
                     ) : (
                       <span className="text-base-content/50">Select protocol</span>
                     )}
                   </div>
-                  <svg className="w-4 h-4 shrink-0 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                  <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/>
                   </svg>
                 </div>
+
                 <ul
                   tabIndex={0}
                   className="dropdown-content menu p-2 shadow-lg bg-base-100 rounded-lg w-full z-50 dropdown-bottom mt-1"
+                  onClickCapture={() => { setDestOpen(false); blurActive(); }}
                 >
-                  {availableProtocols.map(protocol => {
-                    const isCompatible = protocolSupportMap[protocol.name as keyof ProtocolSupportMap];
-                    const isIncompatible = isCompatible === false; // Explicitly false (not null/undefined)
-                    const isLoading = isCompatible === null; // null means still loading
-                    
-                    return (
-                      <li key={protocol.name}>
-                        <button
-                          className={`flex items-center gap-3 py-2 ${
-                            isIncompatible ? "opacity-50 cursor-pointer" : ""
-                          } ${isLoading ? "opacity-70" : ""}`}
-                          onClick={() => setSelectedProtocol(protocol.name)}
-                          disabled={isLoading}
-                        >
-                          <Image
-                            src={getProtocolLogo(protocol.name)}
-                            alt={protocol.name}
-                            width={32}
-                            height={32}
-                            className="rounded-full min-w-[32px]"
-                          />
-                          <span className={`truncate text-lg ${isIncompatible ? "text-base-content/60" : ""}`}>
-                            {protocol.name}
-                            {isIncompatible && position.type === "borrow" && (
-                              <span className="text-xs text-warning ml-2">(no supported collateral)</span>
-                            )}
-                          </span>
-                        </button>
-                      </li>
-                    );
-                  })}
+                  {availableProtocols.map(p => (
+                    <li key={p.name}>
+                      <button
+                        className="flex items-center gap-3 py-2"
+                        onClick={() => { setDestProtocol(p.name); setDestOpen(false); blurActive(); }}
+                      >
+                        <Image src={getProtocolLogo(p.name)} alt={p.name} width={28} height={28} className="rounded-full" />
+                        <span className="truncate">{p.name}</span>
+                      </button>
+                    </li>
+                  ))}
                 </ul>
               </div>
-            </div>
+            </section>
 
-            {availableFlashLoanProviders.length > 0 && (
-              <div>
-                <label className="text-sm font-medium text-base-content/80">Flash Loan Provider</label>
-                {availableFlashLoanProviders.length === 1 ? (
-                  // Show as static display if only one provider available
+            {/* Flash provider (shown only for borrow) */}
+            {position.type === "borrow" && (
+              <section className="card bg-base-200 p-4">
+                <div className="text-sm font-medium mb-2">Flash Loan Provider</div>
+                {availableFlash.length <= 1 ? (
                   <div className="flex items-center gap-3 h-14 border-b-2 border-base-300 px-1">
-                    {selectedFlashLoanProvider && (
+                    {flashProvider ? (
                       <>
-                        <Image
-                          src={selectedFlashLoanProvider.icon}
-                          alt={selectedFlashLoanProvider.name}
-                          width={32}
-                          height={32}
-                          className="rounded-full min-w-[32px]"
-                        />
-                        <span className="truncate font-semibold text-lg">{selectedFlashLoanProvider.name}</span>
+                        <Image src={flashProvider.icon} alt={flashProvider.name} width={24} height={24} className="rounded-full" />
+                        <span className="font-semibold">{flashProvider.name}</span>
                       </>
+                    ) : (
+                      <span className="text-base-content/60 text-sm">Not available on this chain</span>
                     )}
                   </div>
                 ) : (
-                  // Show dropdown if multiple providers available
-                  <div className="dropdown w-full">
+                  <div className={`dropdown w-full ${flashOpen ? "dropdown-open" : ""}`}>
                     <div
                       tabIndex={0}
+                      role="button"
                       className="border-b-2 border-base-300 py-3 px-1 flex items-center justify-between cursor-pointer h-14"
+                      onClick={() => setFlashOpen(o => !o)}
+                      onKeyDown={e => e.key === "Escape" && setFlashOpen(false)}
                     >
                       <div className="flex items-center gap-3 w-[calc(100%-32px)] overflow-hidden">
-                        {selectedFlashLoanProvider && (
+                        {flashProvider && (
                           <>
-                            <Image
-                              src={selectedFlashLoanProvider.icon}
-                              alt={selectedFlashLoanProvider.name}
-                              width={32}
-                              height={32}
-                              className="rounded-full min-w-[32px]"
-                            />
-                            <span className="truncate font-semibold text-lg">{selectedFlashLoanProvider.name}</span>
+                            <Image src={flashProvider.icon} alt={flashProvider.name} width={24} height={24} className="rounded-full" />
+                            <span className="truncate font-semibold">{flashProvider.name}</span>
                           </>
                         )}
                       </div>
-                      <svg className="w-4 h-4 shrink-0 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
+                      <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/>
                       </svg>
                     </div>
+
                     <ul
                       tabIndex={0}
                       className="dropdown-content menu p-2 shadow-lg bg-base-100 rounded-lg w-full z-50 dropdown-bottom mt-1"
+                      onClickCapture={() => { setFlashOpen(false); blurActive(); }}
                     >
-                      {availableFlashLoanProviders.map(provider => (
-                        <li key={provider.name}>
+                      {availableFlash.map(p => (
+                        <li key={p.name}>
                           <button
                             className="flex items-center gap-3 py-2"
-                            onClick={() => setSelectedFlashLoanProvider(provider)}
+                            onClick={() => { setFlashProvider(p); setFlashOpen(false); blurActive(); }}
                           >
-                            <Image
-                              src={provider.icon}
-                              alt={provider.name}
-                              width={32}
-                              height={32}
-                              className="rounded-full min-w-[32px]"
-                            />
-                            <span className="truncate text-lg">{provider.name}</span>
+                            <Image src={p.icon} alt={p.name} width={24} height={24} className="rounded-full" />
+                            <span className="truncate">{p.name}</span>
                           </button>
                         </li>
                       ))}
                     </ul>
                   </div>
                 )}
+              </section>
+            )}
+
+            {/* Collateral picker (borrow only) */}
+            {position.type === "borrow" && (
+              <section className="card bg-base-200 p-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-medium">Collaterals to Move</div>
+                  <div className="text-xs text-base-content/60">{isLoadingSupport ? "Checking support…" : ""}</div>
+                </div>
+                <CollateralSelector
+                  collaterals={collatsForSelector}
+                  isLoading={isLoadingCollats || isLoadingSupport}
+                  selectedProtocol={destProtocol}
+                  onCollateralSelectionChange={onChangeCollats}
+                  marketToken={position.tokenAddress}
+                  hideAmounts
+                />
+                {selectedCollats.length > 0 && (
+                  <div className="mt-4">
+                    <CollateralAmounts
+                      collaterals={selectedCollats}
+                      onChange={setSelectedCollats}
+                      selectedProtocol={destProtocol}
+                    />
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* Debt amount */}
+            <section className="card bg-base-200 p-4">
+              <div className="text-sm font-medium mb-2">Debt Amount</div>
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 w-36 shrink-0">
+                  <div className="w-6 h-6 relative">
+                    <Image src={tokenNameToLogo(position.name)} alt={position.name} fill className="rounded-full object-contain" />
+                  </div>
+                  <span className="truncate font-medium">{position.name}</span>
+                </div>
+                <input
+                  type="text"
+                  className="flex-1 border-b-2 border-base-300 focus:border-primary bg-transparent px-2 h-12 text-lg text-right"
+                  placeholder="0.00"
+                  value={amount}
+                  onChange={e => { setAmount(e.target.value); setIsMaxDebt(false); }}
+                  disabled={loading}
+                />
+                <button className="btn btn-ghost btn-xs" onClick={() => setMaxAmount()} disabled={loading}>MAX</button>
+              </div>
+              <div className="flex justify-between text-xs text-base-content/60 mt-2">
+                <span>Available: {fmt(formattedDebtBalance)} {position.name}</span>
+                <span>≈ ${fmt(debtUsd)}</span>
+              </div>
+            </section>
+
+            {/* Inline issues */}
+            {issues.length > 0 && (
+              <div className="alert alert-warning">
+                <FiAlertTriangle className="w-5 h-5" />
+                <div className="text-sm space-y-1">
+                  {issues.map((i, idx) => <div key={idx}>• {i}</div>)}
+                </div>
+              </div>
+            )}
+
+            {err && (
+              <div className="alert alert-error">
+                <FiAlertTriangle className="w-5 h-5" />
+                <div className="text-sm">{err}</div>
               </div>
             )}
           </div>
-        </div>
-        <div className="flex flex-col items-end gap-3 pt-6 mt-auto">
-          {isPreferenceLoaded && (
-            <div className="pb-1">
-              <label className="label cursor-pointer gap-2 justify-end">
-                <input
-                  type="checkbox"
-                  checked={preferBatching}
-                  onChange={(e) => setPreferBatching(e.target.checked)}
-                  className="checkbox checkbox-sm"
-                />
-                <span className="label-text text-xs">Batch Transactions with Smart Account</span>
-              </label>
-            </div>
-          )}
-          <button
-            className={`btn ${getActionButtonClass()} btn-lg w-60 h-14 flex justify-between shadow-md ${
-              loading ? "animate-pulse" : ""
-            }`}
-            onClick={step === "done" ? onClose : handleMoveDebt}
-            disabled={step === "done" ? false : isActionDisabled}
-          >
-            <span>
-              {loading && <span className="loading loading-spinner loading-sm mr-2"></span>}
-              {getActionButtonText()}
-            </span>
-            <span className="flex items-center gap-1 text-xs">
-              <FaGasPump className="text-gray-400" />
-            </span>
-          </button>
-        </div>
-      </div>
 
-      <form
-        method="dialog"
-        className="modal-backdrop backdrop-blur-sm bg-black/20"
-        onClick={loading ? undefined : onClose}
-      >
-        <button disabled={loading}>close</button>
-      </form>
+          {/* Right: sticky summary */}
+          <div className="lg:col-span-5">
+            <div className="lg:sticky lg:top-4 space-y-4">
+              <section className="card bg-base-200 p-4">
+                <div className="text-sm text-base-content/70 mb-1">From → To</div>
+                <div className="flex items-center gap-3">
+                  <Image src={getProtocolLogo(fromProtocol)} alt={fromProtocol} width={22} height={22} className="rounded-full" />
+                  <span className="font-medium">{fromProtocol}</span>
+                  <span className="opacity-50">→</span>
+                  {destProtocol ? (
+                    <>
+                      <Image src={getProtocolLogo(destProtocol)} alt={destProtocol} width={22} height={22} className="rounded-full" />
+                      <span className="font-medium">{destProtocol}</span>
+                    </>
+                  ) : <span className="text-base-content/60">Select destination</span>}
+                </div>
+
+                {position.type === "borrow" && flashProvider && (
+                  <div className="mt-3 text-sm">
+                    <span className="text-base-content/70 mr-2">Flash:</span>
+                    <span className="inline-flex items-center gap-2">
+                      <Image src={flashProvider.icon} alt={flashProvider.name} width={16} height={16} className="rounded-full" />
+                      {flashProvider.name}
+                    </span>
+                  </div>
+                )}
+              </section>
+
+              <section className="card bg-base-200 p-4">
+                <div className="text-sm text-base-content/70 mb-1">Debt</div>
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 relative">
+                    <Image src={tokenNameToLogo(position.name)} alt={position.name} fill className="rounded-full object-contain" />
+                  </div>
+                  <div className="font-medium">{amount || "0.00"} {position.name}</div>
+                  <div className="text-xs text-base-content/60">≈ ${fmt(debtUsd)}</div>
+                </div>
+              </section>
+
+              {position.type === "borrow" && (
+                <section className="card bg-base-200 p-4">
+                  <div className="text-sm text-base-content/70 mb-2">Collaterals</div>
+                  {selectedCollats.length === 0 ? (
+                    <div className="text-sm text-base-content/60">None</div>
+                  ) : (
+                    <div className="space-y-2 text-sm">
+                      {selectedCollats.map((c, i) => {
+                        const addr = ((c as any).token || (c as any).address || "").toLowerCase();
+                        const p = tokenToPrices[addr];
+                        const normalized = Number(formatUnits(c.amount, c.decimals));
+                        const usd = p ? normalized * Number(formatUnits(p, 8)) : 0;
+                        return (
+                          <div key={i} className="flex justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium">{c.symbol}</span>
+                              <span className="text-base-content/60">{formatUnits(c.amount, c.decimals)}</span>
+                            </div>
+                            <span className="text-base-content/70">${fmt(usd)}</span>
+                          </div>
+                        );
+                      })}
+                      <div className="pt-2 border-t border-base-300 flex justify-between font-medium">
+                        <span>Total</span>
+                        <span>${fmt(collatsUsd)}</span>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {/* Batch + Confirm */}
+              <div className="card bg-base-200 p-4">
+                {isPreferenceLoaded && (
+                  <label className="label cursor-pointer gap-2 mb-3">
+                    <input
+                      type="checkbox"
+                      checked={preferBatching}
+                      onChange={e => setPreferBatching(e.target.checked)}
+                      className="checkbox checkbox-sm"
+                    />
+                    <span className="label-text text-xs">Batch transactions with Smart Account</span>
+                  </label>
+                )}
+                <button
+                  className={`btn btn-primary w-full h-12 ${canConfirm ? "" : "btn-disabled"}`}
+                  onClick={handleConfirm}
+                  disabled={!canConfirm}
+                >
+                  {loading && <span className="loading loading-spinner loading-sm mr-2" />}
+                  Confirm & Migrate
+                  <FaGasPump className="ml-2 opacity-80" />
+                </button>
+                <div className="text-[11px] text-base-content/60 mt-2">
+                  By confirming, the router will flash-unlock your debt, move selected collateral, and borrow on the destination to repay flash.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <form method="dialog" className="modal-backdrop backdrop-blur-sm bg-black/20" onClick={loading ? undefined : onClose}>
+          <button disabled={loading}>close</button>
+        </form>
+      </div>
     </dialog>
   );
 };
