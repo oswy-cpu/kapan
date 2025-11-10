@@ -10,7 +10,7 @@ import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import { FaGasPump } from "react-icons/fa";
 import { FiAlertTriangle, FiChevronDown, FiChevronUp, FiX } from "react-icons/fi";
-import { formatUnits, parseUnits } from "viem";
+import { formatUnits } from "viem";
 import { useAccount, useReadContract, useSwitchChain } from "wagmi";
 import { CollateralSelector, CollateralWithAmount } from "~~/components/specific/collateral/CollateralSelector";
 import { ERC20ABI, tokenNameToLogo } from "~~/contracts/externalContracts";
@@ -21,7 +21,7 @@ import { useDeployedContractInfo } from "~~/hooks/scaffold-eth/useDeployedContra
 import { useCollateralSupport } from "~~/hooks/scaffold-eth/useCollateralSupport";
 import { useCollaterals } from "~~/hooks/scaffold-eth/useCollaterals";
 import { getProtocolLogo } from "~~/utils/protocol";
-import { fetchPrice } from "~~/services/web3/PriceService";
+import { useTokenPriceApi } from "~~/hooks/useTokenPriceApi";
 
 type FlashLoanProvider = {
   name: "Balancer V2" | "Balancer V3" | "Aave V3";
@@ -58,6 +58,36 @@ const AAVE_CHAINS = [42161, 8453, 10, 59144];
 const HF_SAFE = 2.0;
 const HF_RISK = 1.5;
 const HF_DANGER = 1.1;
+
+/**
+ * Invisible helper to fetch a collateral's USD price via the API wrapper hook.
+ * Reports the price back to parent as 8-decimal bigint. Never reads on-chain.
+ */
+const CollatPriceProbe: FC<{
+  symbol?: string;
+  address: string;
+  onPrice: (address: string, price8d?: bigint) => void;
+  enabled: boolean;
+}> = ({ symbol, address, onPrice, enabled }) => {
+  const sym = (symbol || "").trim();
+
+  // Only call the hook if enabled and symbol exists
+  const result = enabled && sym ? useTokenPriceApi(sym) : { isSuccess: false, price: undefined as number | undefined };
+
+  useEffect(() => {
+    if (!enabled || !sym) {
+      return;
+    }
+    const priceNum = (result as any)?.price as number | undefined;
+    const ok = (result as any)?.isSuccess && typeof priceNum === "number" && isFinite(priceNum) && priceNum > 0;
+    if (ok) {
+      onPrice(address.toLowerCase(), BigInt(Math.round(priceNum * 1e8)));
+    }
+    // If still loading or failed, do nothing; parent will treat as missing
+  }, [enabled, sym, address, onPrice, (result as any)?.isSuccess, (result as any)?.price]);
+
+  return null;
+};
 
 export const MovePositionModal: FC<MovePositionModalProps> = ({
   isOpen,
@@ -212,29 +242,50 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     [fetchedCollats, supportedCollaterals]
   );
 
-  const tokenToPrices = useMemo(() => {
+  /**
+   * Prices map (8 decimals) — API for collaterals ONLY, borrow price comes from props.
+   * No on-chain price reads here.
+   */
+  const [tokenToPrices, setTokenToPrices] = useState<Record<string, bigint>>(() => {
     const map: Record<string, bigint> = {};
-  
-    // debt token price from position (8 decimals)
     if (position?.tokenAddress && position?.tokenPrice) {
       map[position.tokenAddress.toLowerCase()] = position.tokenPrice;
     }
-  
-    // collateral prices (8 decimals)
-    for (const c of fetchedCollats ?? []) {
-      const addr = (c?.address || c?.token || "").toLowerCase();
-      // tolerate different shapes: c.price (bigint), c.price.value, or c.tokenPrice
-      const p: bigint | undefined =
-        (typeof c?.price === "bigint" ? c.price :
-         typeof c?.price?.value === "bigint" ? c.price.value :
-         c?.tokenPrice);
-  
-      if (addr && p && p > 0n) map[addr] = p;
-    }
-  
     return map;
-  }, [fetchedCollats, position?.tokenAddress, position?.tokenPrice]);  
-  
+  });
+
+  // Keep borrow token price in sync if props change
+  useEffect(() => {
+    if (position?.tokenAddress && position?.tokenPrice) {
+      const addr = position.tokenAddress.toLowerCase();
+      setTokenToPrices(prev => ({ ...prev, [addr]: position.tokenPrice as bigint }));
+    }
+  }, [position?.tokenAddress, position?.tokenPrice]);
+
+  // Probe collateral prices via API (no on-chain) — one invisible probe per collateral.
+  const apiProbes = useMemo(() => {
+    if (!isOpen) return null;
+    return collatsForSelector.map(c => {
+      const addr = (c?.address || c?.token || "").toLowerCase();
+      const symbol = (c?.symbol || c?.name || "").toString();
+      return (
+        <CollatPriceProbe
+          key={addr || symbol}
+          address={addr}
+          symbol={symbol}
+          enabled={!!addr && !!symbol}
+          onPrice={(a, p8) => {
+            if (!p8 || p8 <= 0n) return;
+            setTokenToPrices(prev => {
+              if (prev[a] === p8) return prev; // skip re-render if unchanged
+              return { ...prev, [a]: p8 };
+            });
+          }}
+        />
+      );
+    });
+  }, [collatsForSelector, isOpen]);
+
   // Then keep using:
   const debtPrice = tokenToPrices[position.tokenAddress.toLowerCase()] ?? 0n;
 
@@ -275,23 +326,96 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     return remaining * price;
   }, [position.balance, amount, debtPrice]);
 
+  const getLtBps = (c: any): number => {
+    const bps = Number(
+      c?.liquidationThresholdBps ??
+      c?.collateralFactorBps ??
+      c?.ltBps ??
+      c?.ltvBps ??
+      8273
+    );
+    return Math.max(0, Math.min(10000, bps));
+  };
+  
+  const price8 = (addr: string, tokenToPrices: Record<string, bigint>) =>
+    tokenToPrices[addr.toLowerCase()] ?? 0n;
+  
+  const toUsd = (amount: bigint, decimals: number, p8: bigint): number => {
+    if (!p8 || p8 === 0n || !amount) return 0;
+    return Number(formatUnits(amount, decimals)) * Number(formatUnits(p8, 8));
+  };
+  
+  /**
+   * Compute HF = sum_i( collateral_i_usd * LT_i ) / total_debt_usd
+   * - `all`            : full list of collaterals (e.g., collatsForSelector)
+   * - `moved`          : array of selected collats to move (subtract from balances)
+   * - `tokenToPrices`  : map of token address -> price (8d bigint)
+   * - `totalDebtUsd`   : current or projected debt in USD
+   */
+  const computeHF = (
+    all: any[],
+    moved: { token?: string; address?: string; amount: bigint; decimals: number }[],
+    tokenToPrices: Record<string, bigint>,
+    totalDebtUsd: number
+  ): number => {
+    // Build addr -> movedAmount map
+    const movedByAddr = new Map<string, bigint>();
+    for (const m of moved || []) {
+      const addr = ((m as any).token || (m as any).address || "").toLowerCase();
+      if (!addr) continue;
+      const prev = movedByAddr.get(addr) ?? 0n;
+      movedByAddr.set(addr, prev + (m.amount ?? 0n));
+    }
+  
+    let weightedCollUsd = 0;
+  
+    for (const c of all || []) {
+      const addr = (c?.address || c?.token || "").toLowerCase();
+      if (!addr) continue;
+  
+      const rawBal: bigint = c?.rawBalance ?? 0n;
+      const decs: number = c?.decimals ?? 18;
+      const lt = getLtBps(c) / 1e4; // 0..1
+      if (lt <= 0) continue;
+  
+      // Subtract the portion we’re moving away
+      const movedAmt = movedByAddr.get(addr) ?? 0n;
+      const remaining = rawBal - movedAmt;
+      if (remaining <= 0n) continue;
+  
+      const p8 = price8(addr, tokenToPrices);
+      if (p8 === 0n) continue;
+  
+      const usd = toUsd(remaining, decs, p8);
+      weightedCollUsd += usd * lt;
+    }
+  
+    if (!isFinite(totalDebtUsd) || totalDebtUsd <= 0) return 999;
+    return weightedCollUsd / totalDebtUsd;
+  };  
+
+  const currentDebtUsd = useMemo(() => {
+    const price = Number(formatUnits(debtPrice, 8));
+    return Math.abs(position.balance) * price;
+  }, [position.balance, debtPrice]);
+
   const currentHF = useMemo(() => {
-    const totalColl = collatsForSelector.reduce((sum, c) => {
-      const addr = c.address.toLowerCase();
-      const p = tokenToPrices[addr];
-      const normalized = Number(formatUnits(c.rawBalance, c.decimals));
-      const usd = p ? normalized * Number(formatUnits(p, 8)) : 0;
-      return sum + usd;
-    }, 0);
-    const totalDebt = Math.abs(position.balance) * Number(formatUnits(debtPrice, 8));
-    if (totalDebt === 0 || totalColl === 0) return 999;
-    return totalColl / totalDebt;
-  }, [collatsForSelector, tokenToPrices, position.balance, debtPrice]);
+    return computeHF(
+      collatsForSelector,         // all current collaterals
+      [],                         // nothing moved yet
+      tokenToPrices,              // prices (8d)
+      currentDebtUsd              // current debt USD
+    );
+  }, [collatsForSelector, tokenToPrices, currentDebtUsd]);  
 
   const projectedHF = useMemo(() => {
-    if (remainingDebtUsd === 0 || remainingCollateralUsd === 0) return 999;
-    return (remainingCollateralUsd * 0.85) / remainingDebtUsd;
-  }, [remainingCollateralUsd, remainingDebtUsd]);
+    return computeHF(
+      collatsForSelector,         // use same source list
+      selectedCollats,            // subtract what we plan to move
+      tokenToPrices,
+      remainingDebtUsd            // your existing projected debt USD
+    );
+  }, [collatsForSelector, selectedCollats, tokenToPrices, remainingDebtUsd]);
 
   const hfTone = (hf: number) => {
     if (hf >= HF_SAFE) return { tone: "text-success", badge: "badge-success" };
@@ -472,6 +596,9 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
 
         {/* CONTENT */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {/* Invisible API price probes for collaterals */}
+          {apiProbes}
+
           {/* Health Factor banner (subtle, square) */}
           {position.type === "borrow" && currentHF < 999 && parseFloat(amount || "0") > 0 && selectedCollats.length > 0 && (
             <div className="border border-base-300 rounded-none p-3">
