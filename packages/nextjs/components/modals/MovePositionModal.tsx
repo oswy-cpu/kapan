@@ -23,6 +23,9 @@ import { useCollaterals } from "~~/hooks/scaffold-eth/useCollaterals";
 import { getProtocolLogo } from "~~/utils/protocol";
 import { useTokenPriceApi } from "~~/hooks/useTokenPriceApi";
 
+// -------------------------
+// Constants / helpers (pure)
+// -------------------------
 type FlashLoanProvider = {
   name: "Balancer V2" | "Balancer V3" | "Aave V3";
   icon: string;
@@ -36,6 +39,85 @@ const ALL_FLASH_LOAN_PROVIDERS: FlashLoanProvider[] = [
   { name: "Aave V3", icon: "/logos/aave.svg", version: "aave", providerEnum: 2 },
 ] as const;
 
+const BALANCER_CHAINS = [42161, 8453, 10];
+const AAVE_CHAINS = [42161, 8453, 10, 59144];
+
+// Health Factor thresholds
+const HF_SAFE = 2.0;
+const HF_RISK = 1.5;
+const HF_DANGER = 1.1;
+
+// liquidation threshold getter (bps→clamped)
+const getLtBps = (c: any): number => {
+  const bps = Number(
+    c?.liquidationThresholdBps ??
+      c?.collateralFactorBps ??
+      c?.ltBps ??
+      c?.ltvBps ??
+      8273,
+  );
+  return Math.max(0, Math.min(10000, bps));
+};
+
+const price8 = (addr: string, tokenToPrices: Record<string, bigint>) =>
+  tokenToPrices[addr.toLowerCase()] ?? 0n;
+
+const toUsd = (amount: bigint, decimals: number, p8: bigint): number => {
+  if (!p8 || p8 === 0n || !amount) return 0;
+  return Number(formatUnits(amount, decimals)) * Number(formatUnits(p8, 8));
+};
+
+/**
+ * Compute HF = sum_i( collateral_i_usd * LT_i ) / total_debt_usd
+ * - `all`            : full list of collaterals (e.g., collatsForSelector)
+ * - `moved`          : array of selected collats to move (subtract from balances)
+ * - `tokenToPrices`  : map of token address -> price (8d bigint)
+ * - `totalDebtUsd`   : current or projected debt in USD
+ */
+const computeHF = (
+  all: any[],
+  moved: { token?: string; address?: string; amount: bigint; decimals: number }[],
+  tokenToPrices: Record<string, bigint>,
+  totalDebtUsd: number,
+): number => {
+  const movedByAddr = new Map<string, bigint>();
+  for (const m of moved || []) {
+    const addr = ((m as any).token || (m as any).address || "").toLowerCase();
+    if (!addr) continue;
+    const prev = movedByAddr.get(addr) ?? 0n;
+    movedByAddr.set(addr, prev + (m.amount ?? 0n));
+  }
+
+  let weightedCollUsd = 0;
+
+  for (const c of all || []) {
+    const addr = (c?.address || c?.token || "").toLowerCase();
+    if (!addr) continue;
+
+    const rawBal: bigint = c?.rawBalance ?? 0n;
+    const decs: number = c?.decimals ?? 18;
+    const lt = getLtBps(c) / 1e4; // 0..1
+    if (lt <= 0) continue;
+
+    // Subtract moved
+    const movedAmt = movedByAddr.get(addr) ?? 0n;
+    const remaining = rawBal - movedAmt;
+    if (remaining <= 0n) continue;
+
+    const p8 = price8(addr, tokenToPrices);
+    if (p8 === 0n) continue;
+
+    const usd = toUsd(remaining, decs, p8);
+    weightedCollUsd += usd * lt;
+  }
+
+  if (!isFinite(totalDebtUsd) || totalDebtUsd <= 0) return 999;
+  return weightedCollUsd / totalDebtUsd;
+};
+
+// -----------------------------------
+// Props
+// -----------------------------------
 interface MovePositionModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -51,18 +133,9 @@ interface MovePositionModalProps {
   chainId?: number;
 }
 
-const BALANCER_CHAINS = [42161, 8453, 10];
-const AAVE_CHAINS = [42161, 8453, 10, 59144];
-
-// Health Factor thresholds
-const HF_SAFE = 2.0;
-const HF_RISK = 1.5;
-const HF_DANGER = 1.1;
-
-/**
- * Invisible helper to fetch a collateral's USD price via the API wrapper hook.
- * Reports the price back to parent as 8-decimal bigint. Never reads on-chain.
- */
+// -------------------------------------------------
+// Invisible helper: 1 hook/token, never conditional
+// -------------------------------------------------
 const CollatPriceProbe: FC<{
   symbol?: string;
   address: string;
@@ -71,24 +144,24 @@ const CollatPriceProbe: FC<{
 }> = ({ symbol, address, onPrice, enabled }) => {
   const sym = (symbol || "").trim();
 
-  // Only call the hook if enabled and symbol exists
-  const result = enabled && sym ? useTokenPriceApi(sym) : { isSuccess: false, price: undefined as number | undefined };
+  // Always call the hook; only *use* it when enabled.
+  type PriceHookShape = { isSuccess?: boolean; price?: number };
+  const { isSuccess, price } = useTokenPriceApi(sym) as PriceHookShape;
 
   useEffect(() => {
-    if (!enabled || !sym) {
-      return;
-    }
-    const priceNum = (result as any)?.price as number | undefined;
-    const ok = (result as any)?.isSuccess && typeof priceNum === "number" && isFinite(priceNum) && priceNum > 0;
+    if (!enabled || !sym) return;
+    const ok = isSuccess && typeof price === "number" && isFinite(price) && price > 0;
     if (ok) {
-      onPrice(address.toLowerCase(), BigInt(Math.round(priceNum * 1e8)));
+      onPrice(address.toLowerCase(), BigInt(Math.round(price * 1e8)));
     }
-    // If still loading or failed, do nothing; parent will treat as missing
-  }, [enabled, sym, address, onPrice, (result as any)?.isSuccess, (result as any)?.price]);
+  }, [enabled, sym, address, isSuccess, price, onPrice]);
 
   return null;
 };
 
+// ===================================
+// Main component
+// ===================================
 export const MovePositionModal: FC<MovePositionModalProps> = ({
   isOpen,
   onClose,
@@ -104,8 +177,11 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   const { data: routerContract } = useDeployedContractInfo({ contractName: "KapanRouter", chainId: chainId as any });
 
   // --- Modern minimal protocol choices (chips) ---
-  const protocols = [{ name: "Aave V3" }, { name: "Compound V3" }, { name: "Venus" }];
-  const availableProtocols = protocols.filter(p => p.name !== fromProtocol);
+  const protocols = useMemo(() => [{ name: "Aave V3" }, { name: "Compound V3" }, { name: "Venus" }], []);
+  const availableProtocols = useMemo(
+    () => protocols.filter(p => p.name !== fromProtocol),
+    [protocols, fromProtocol],
+  );
   const [destProtocol, setDestProtocol] = useState<string>(availableProtocols[0]?.name || "");
 
   // --- Auto-close dropdown state handling ---
@@ -129,6 +205,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   const [collateralOpen, setCollateralOpen] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
+  // Ensure correct chain on open
   useEffect(() => {
     if (!isOpen || !chainId) return;
     if (chain?.id !== chainId) {
@@ -138,24 +215,26 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     }
   }, [isOpen, chainId, chain?.id, switchChain]);
 
-  // --- Flash availability (same logic, cleaner UI) ---
+  // --- Flash availability ---
+  const flashQueryEnabled = isOpen && !!chainId && !!routerContract?.address;
+
   const { data: balancerV2Enabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "balancerV2Enabled",
-    query: { enabled: isOpen && !!chainId && !!routerContract?.address },
+    query: { enabled: flashQueryEnabled },
   });
   const { data: balancerV3Enabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "balancerV3Enabled",
-    query: { enabled: isOpen && !!chainId && !!routerContract?.address },
+    query: { enabled: flashQueryEnabled },
   });
   const { data: aaveEnabled } = useReadContract({
     address: routerContract?.address as `0x${string}` | undefined,
     abi: routerContract?.abi,
     functionName: "aaveEnabled",
-    query: { enabled: isOpen && !!chainId && !!routerContract?.address },
+    query: { enabled: flashQueryEnabled },
   });
 
   const availableFlash = useMemo(() => {
@@ -173,17 +252,17 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   }, [availableFlash, flashProvider]);
 
   // --- Collateral & prices ---
+  const userAddrOrZero = userAddress || "0x0000000000000000000000000000000000000000";
   const { collaterals: fetchedCollats, isLoading: isLoadingCollats } = useCollaterals(
     position.tokenAddress,
     fromProtocol,
-    userAddress || "0x0000000000000000000000000000000000000000",
-    isOpen
+    userAddrOrZero,
+    isOpen,
   );
 
   const collateralAddresses = useMemo(
     () => fetchedCollats.map((c: any) => c.address),
-    // JSON stringify trick to update when list of addresses changes without deep deps
-    [JSON.stringify(fetchedCollats.map((c: any) => c.address))]
+    [fetchedCollats],
   );
 
   const PROTOCOL_TO_GATEWAY: Record<string, "AaveGatewayView" | "CompoundGatewayView" | "VenusGatewayView"> = {
@@ -191,13 +270,17 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     compound: "CompoundGatewayView",
     venus: "VenusGatewayView",
   };
-  const normalizedFrom = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+
+  const normalizedFrom = useMemo(
+    () => fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, ""),
+    [fromProtocol],
+  );
   const gatewayContractName = PROTOCOL_TO_GATEWAY[normalizedFrom] || "AaveGatewayView";
 
   const { data: tokenBalance } = useScaffoldReadContract({
     contractName: gatewayContractName,
     functionName: "getBorrowBalance",
-    args: [position.tokenAddress, userAddress || "0x0000000000000000000000000000000000000000"],
+    args: [position.tokenAddress, userAddrOrZero],
     query: { enabled: isOpen },
   });
 
@@ -216,7 +299,10 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     query: { enabled: isOpen },
   });
 
-  const normalizedDest = destProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+  const normalizedDest = useMemo(
+    () => destProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, ""),
+    [destProtocol],
+  );
   const destGatewayContractName = PROTOCOL_TO_GATEWAY[normalizedDest] || "AaveGatewayView";
 
   const { data: destBorrowRateData } = useScaffoldReadContract({
@@ -230,7 +316,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     destProtocol,
     position.tokenAddress,
     collateralAddresses,
-    isOpen
+    isOpen,
   );
 
   const collatsForSelector = useMemo(
@@ -239,7 +325,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
         ...c,
         supported: supportedCollaterals[c.address] === true,
       })),
-    [fetchedCollats, supportedCollaterals]
+    [fetchedCollats, supportedCollaterals],
   );
 
   /**
@@ -258,7 +344,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   useEffect(() => {
     if (position?.tokenAddress && position?.tokenPrice) {
       const addr = position.tokenAddress.toLowerCase();
-      setTokenToPrices(prev => ({ ...prev, [addr]: position.tokenPrice as bigint }));
+      setTokenToPrices(prev => (prev[addr] === position.tokenPrice ? prev : { ...prev, [addr]: position.tokenPrice as bigint }));
     }
   }, [position?.tokenAddress, position?.tokenPrice]);
 
@@ -268,27 +354,26 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     return collatsForSelector.map(c => {
       const addr = (c?.address || c?.token || "").toLowerCase();
       const symbol = (c?.symbol || c?.name || "").toString();
+      const enabled = !!addr && !!symbol;
       return (
         <CollatPriceProbe
           key={addr || symbol}
           address={addr}
           symbol={symbol}
-          enabled={!!addr && !!symbol}
+          enabled={enabled}
           onPrice={(a, p8) => {
             if (!p8 || p8 <= 0n) return;
-            setTokenToPrices(prev => {
-              if (prev[a] === p8) return prev; // skip re-render if unchanged
-              return { ...prev, [a]: p8 };
-            });
+            setTokenToPrices(prev => (prev[a] === p8 ? prev : { ...prev, [a]: p8 }));
           }}
         />
       );
     });
   }, [collatsForSelector, isOpen]);
 
-  // Then keep using:
+  // Debt price from map
   const debtPrice = tokenToPrices[position.tokenAddress.toLowerCase()] ?? 0n;
 
+  // USD calcs
   const debtUsd = useMemo(() => {
     const amt = parseFloat(amount || "0");
     const price = Number(formatUnits(debtPrice, 8));
@@ -306,7 +391,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   }, [selectedCollats, tokenToPrices]);
 
   const remainingCollateralUsd = useMemo(() => {
-    const total = collatsForSelector.reduce((sum, c) => {
+    return collatsForSelector.reduce((sum, c) => {
       const selectedCollat = selectedCollats.find(sc => sc.token === c.address);
       const remaining = selectedCollat ? c.rawBalance - selectedCollat.amount : c.rawBalance;
       const addr = c.address.toLowerCase();
@@ -315,7 +400,6 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
       const usd = p ? normalized * Number(formatUnits(p, 8)) : 0;
       return sum + usd;
     }, 0);
-    return total;
   }, [collatsForSelector, selectedCollats, tokenToPrices]);
 
   const remainingDebtUsd = useMemo(() => {
@@ -326,96 +410,20 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
     return remaining * price;
   }, [position.balance, amount, debtPrice]);
 
-  const getLtBps = (c: any): number => {
-    const bps = Number(
-      c?.liquidationThresholdBps ??
-      c?.collateralFactorBps ??
-      c?.ltBps ??
-      c?.ltvBps ??
-      8273
-    );
-    return Math.max(0, Math.min(10000, bps));
-  };
-  
-  const price8 = (addr: string, tokenToPrices: Record<string, bigint>) =>
-    tokenToPrices[addr.toLowerCase()] ?? 0n;
-  
-  const toUsd = (amount: bigint, decimals: number, p8: bigint): number => {
-    if (!p8 || p8 === 0n || !amount) return 0;
-    return Number(formatUnits(amount, decimals)) * Number(formatUnits(p8, 8));
-  };
-  
-  /**
-   * Compute HF = sum_i( collateral_i_usd * LT_i ) / total_debt_usd
-   * - `all`            : full list of collaterals (e.g., collatsForSelector)
-   * - `moved`          : array of selected collats to move (subtract from balances)
-   * - `tokenToPrices`  : map of token address -> price (8d bigint)
-   * - `totalDebtUsd`   : current or projected debt in USD
-   */
-  const computeHF = (
-    all: any[],
-    moved: { token?: string; address?: string; amount: bigint; decimals: number }[],
-    tokenToPrices: Record<string, bigint>,
-    totalDebtUsd: number
-  ): number => {
-    // Build addr -> movedAmount map
-    const movedByAddr = new Map<string, bigint>();
-    for (const m of moved || []) {
-      const addr = ((m as any).token || (m as any).address || "").toLowerCase();
-      if (!addr) continue;
-      const prev = movedByAddr.get(addr) ?? 0n;
-      movedByAddr.set(addr, prev + (m.amount ?? 0n));
-    }
-  
-    let weightedCollUsd = 0;
-  
-    for (const c of all || []) {
-      const addr = (c?.address || c?.token || "").toLowerCase();
-      if (!addr) continue;
-  
-      const rawBal: bigint = c?.rawBalance ?? 0n;
-      const decs: number = c?.decimals ?? 18;
-      const lt = getLtBps(c) / 1e4; // 0..1
-      if (lt <= 0) continue;
-  
-      // Subtract the portion we’re moving away
-      const movedAmt = movedByAddr.get(addr) ?? 0n;
-      const remaining = rawBal - movedAmt;
-      if (remaining <= 0n) continue;
-  
-      const p8 = price8(addr, tokenToPrices);
-      if (p8 === 0n) continue;
-  
-      const usd = toUsd(remaining, decs, p8);
-      weightedCollUsd += usd * lt;
-    }
-  
-    if (!isFinite(totalDebtUsd) || totalDebtUsd <= 0) return 999;
-    return weightedCollUsd / totalDebtUsd;
-  };  
-
   const currentDebtUsd = useMemo(() => {
     const price = Number(formatUnits(debtPrice, 8));
     return Math.abs(position.balance) * price;
   }, [position.balance, debtPrice]);
 
-  const currentHF = useMemo(() => {
-    return computeHF(
-      collatsForSelector,         // all current collaterals
-      [],                         // nothing moved yet
-      tokenToPrices,              // prices (8d)
-      currentDebtUsd              // current debt USD
-    );
-  }, [collatsForSelector, tokenToPrices, currentDebtUsd]);  
+  const currentHF = useMemo(
+    () => computeHF(collatsForSelector, [], tokenToPrices, currentDebtUsd),
+    [collatsForSelector, tokenToPrices, currentDebtUsd],
+  );
 
-  const projectedHF = useMemo(() => {
-    return computeHF(
-      collatsForSelector,         // use same source list
-      selectedCollats,            // subtract what we plan to move
-      tokenToPrices,
-      remainingDebtUsd            // your existing projected debt USD
-    );
-  }, [collatsForSelector, selectedCollats, tokenToPrices, remainingDebtUsd]);
+  const projectedHF = useMemo(
+    () => computeHF(collatsForSelector, selectedCollats, tokenToPrices, remainingDebtUsd),
+    [collatsForSelector, selectedCollats, tokenToPrices, remainingDebtUsd],
+  );
 
   const hfTone = (hf: number) => {
     if (hf >= HF_SAFE) return { tone: "text-success", badge: "badge-success" };
@@ -489,8 +497,8 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
       if (!flashProvider) throw new Error("No flash loan provider available.");
 
       const builder = createMoveBuilder();
-      const normSel = destProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
-      const normFrom = fromProtocol.toLowerCase().replace(/\s+v\d+$/i, "").replace(/\s+/g, "");
+      const normSel = normalizedDest;
+      const normFrom = normalizedFrom;
       if (normSel === "compound" || normFrom === "compound") {
         builder.setCompoundMarket(position.tokenAddress as `0x${string}`);
       }
@@ -548,7 +556,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
   return (
     <dialog open={isOpen} className="modal modal-open">
       <div className="modal-box max-w-[520px] md:max-w-[560px] w-full p-0 max-h-[85vh] flex flex-col rounded-none shadow-none border border-base-300">
-      {/* HEADER */}
+        {/* HEADER */}
         <div className="sticky top-0 z-10 bg-base-100 border-b border-base-300 px-4 py-3">
           <div className="flex items-center justify-between">
             <h3 className="font-semibold text-base tracking-tight">Move Position</h3>
@@ -599,7 +607,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
           {/* Invisible API price probes for collaterals */}
           {apiProbes}
 
-          {/* Health Factor banner (subtle, square) */}
+          {/* Health Factor banner */}
           {position.type === "borrow" && currentHF < 999 && parseFloat(amount || "0") > 0 && selectedCollats.length > 0 && (
             <div className="border border-base-300 rounded-none p-3">
               <div className="flex items-start gap-2 text-xs">
@@ -628,7 +636,7 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
               <input
                 type="text"
                 inputMode="decimal"
-                className="input input-sm input-bordered w-full text-right rounded-none pr-28" // was pr-16
+                className="input input-sm input-bordered w-full text-right rounded-none pr-28"
                 placeholder="0.00"
                 value={amount}
                 onChange={e => {
@@ -637,7 +645,6 @@ export const MovePositionModal: FC<MovePositionModalProps> = ({
                 }}
                 disabled={loading}
               />
-              {/* Fixed-width suffix to prevent overflow */}
               <div className="absolute inset-y-0 right-0 w-28 flex items-center justify-end gap-2 pr-2">
                 <div className="flex items-center gap-1 text-[10px] opacity-70 shrink-0">
                   <span className="inline-flex w-3 h-3 overflow-hidden">
